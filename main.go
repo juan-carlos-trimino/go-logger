@@ -29,51 +29,52 @@ Next, open the file that will use the package and add this line
 
 import "github.com/juan-carlos-trimino/gplogger"
 
-To upgrade/downgrade the version of the package, execute
+To upgrade/downgrade the version of the package, move to the root of the module's directory
+structure (where the go.mod file is located) and execute
 (go get -u "{package-name}@{git-commit-hash}").
 $ go get -u "github.com/juan-carlos-trimino/gplogger@f218b1c"
 ***/
 
 import (
-  "encoding/json"
-  "fmt"
-  "time"
+	"encoding/json"
+	"fmt"
+	"time"
 )
 
 type logEntry struct {
-  DateTime string "json:\"date_time\""
-  Level string `json:"level"`
-  CorrelationId string `json:"correlation_id"`
-  Message string `json:"msg"`
+	DateTime      string "json:\"date_time\""
+	Level         string `json:"level"`
+	CorrelationId string `json:"correlation_id"`
+	Message       string `json:"msg"`
 }
 
 func LogInfo(msg, cid string) {
-  printMessage(msg, cid, "INFO")
+	printMessage(msg, cid, "INFO")
 }
 
 func LogWarning(msg, cid string) {
-  printMessage(msg, cid, "WARN")
+	printMessage(msg, cid, "WARN")
 }
 
 func LogError(msg, cid string) {
-  printMessage(msg, cid, "ERROR")
+	printMessage(msg, cid, "ERROR")
 }
 
 func DatetimeFormat() string {
-  //time.Now() returns the current local time; using the current time in UTC.
-  return time.Now().UTC().Format(time.RFC3339Nano)
+	//time.Now() returns the current local time; using the current time in UTC.
+	return time.Now().UTC().Format(time.RFC3339Nano)
 }
 
 func printMessage(msg, cid, level string) {
-  le := logEntry{
-    DateTime: DatetimeFormat(),
-    CorrelationId: cid,
-    Level: level,
-    Message: msg,
-  }
-  json, err := json.Marshal(le)
-  if err != nil {
-    panic(err)
-  }
-  fmt.Println(string(json))
+	le := logEntry{
+		DateTime:      DatetimeFormat(),
+		CorrelationId: cid,
+		Level:         level,
+		Message:       msg,
+	}
+	json, err := json.Marshal(le)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(json))
 }
