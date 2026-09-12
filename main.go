@@ -27,12 +27,14 @@ $ go get -u github.com/juan-carlos-trimino/gplogger
 Next, open the file that will use the package and add this line
 ("github.com/{GitHub-Username}/{Repo-Name}").
 
-import "github.com/juan-carlos-trimino/gplogger"
+import "github.com/juan-carlos-trimino/go-logger"
 
 To upgrade/downgrade the version of the package, move to the root of the module's directory
 structure (where the go.mod file is located) and execute
 (go get -u "{package-name}@{git-commit-hash}").
-$ go get -u "github.com/juan-carlos-trimino/gplogger@f218b1c"
+$ go get -u "github.com/juan-carlos-trimino/go-logger@f218b1c"
+or
+go get -u "github.com/juan-carlos-trimino/go-logger@v1.x.x"
 ***/
 
 import (
