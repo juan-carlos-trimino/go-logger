@@ -1,3 +1,3 @@
-module github.com/juan-carlos-trimino/gplogger
+module github.com/juan-carlos-trimino/go-logger
 
-go 1.24.3
+go 1.26.4
