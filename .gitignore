@@ -5,5 +5,5 @@
 !.gitignore
 !go.mod
 !LICENSE
-!main.go
+!logger.go
 !README.md
