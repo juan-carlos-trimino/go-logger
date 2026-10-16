@@ -11,7 +11,6 @@ package logger
 
 import (
   "bytes"
-  "encoding/json"
   "os"
   "strconv"
   "strings"
@@ -43,6 +42,8 @@ Why this architecture survives critical enterprise scales:
 const (
   //The async queue capacity (up to 50,000 log bursts in memory before blocking).
   logQueueCapacity = 50_000
+  //Pool allocates fixed-size byte chunks, which easily accommodate most log lines.
+  poolSize = 4_096
 )
 
 var (
@@ -62,7 +63,7 @@ var (
   //A dedicated pool for raw byte slice snapshots; it allocates fixed 4KB blocks to prevent frequent heap resizing.
   snapshotPool = sync.Pool{
     New: func() any {
-      b := make([]byte, 4096)
+      b := make([]byte, poolSize)
       return &b  //Pass a pointer to avoid interface boxing overhead.
     },
   }
@@ -72,6 +73,8 @@ var (
   Developers use it to create pure signaling channels.
   ***/
   monitorStopChan chan struct{}
+  initLoggerOnce sync.Once  //Zero value is ready to use; do not copy after use.
+  closeLoggerOnce sync.Once
 )
 
 //Generic constraint that limits parameters strictly to string or byte slices.
@@ -83,6 +86,7 @@ type Loggable interface{
 type asyncLogPayload struct{
   msgStr   string  //Separate fields prevent string-to-byte mutations.
   msgBytes []byte
+  poolSlice *[]byte  //Hold the exact pointer returned by Get().
   cid      string
   level    string
   isPooled bool
@@ -96,66 +100,77 @@ Initialize the logging engine pipeline. Call InitLogger() ONCE from the main.go 
 ensure it is called before any log statements.
 ***/
 func InitLogger() {
-  //A channel that can hold logQueueCapacity asyncLogPayload before blocking the sender.
-  logChannel = make(chan asyncLogPayload, logQueueCapacity)
-  /***
-  Initialize an unbuffered channel.
-  * The sending goroutine blocks until another goroutine receives from the channel.
-  * The receiving goroutine blocks until another goroutine sends data into the channel.
-  ***/
-  monitorStopChan = make(chan struct{})
-  //Spin up a single dedicated background worker thread to process all terminal write I/O.
-  workerWg.Add(1)
-  go logWorker()
-  //Kick off the background telemetry routine
-  startDroppedLogsMonitor()
+  initLoggerOnce.Do(func() {
+    //A channel that can hold logQueueCapacity asyncLogPayload before blocking the sender.
+    logChannel = make(chan asyncLogPayload, logQueueCapacity)
+    /***
+    Initialize an unbuffered channel.
+    * The sending goroutine blocks until another goroutine receives from the channel.
+    * The receiving goroutine blocks until another goroutine sends data into the channel.
+    ***/
+    monitorStopChan = make(chan struct{})
+    //Spin up a single dedicated background worker thread to process all terminal write I/O.
+    workerWg.Add(1)  //Increase the WaitGroup counter by exactly 1.
+    go logWorker()
+    //Kick off the background telemetry routine
+    go startDroppedLogsMonitor()
+  })
 }
 
 //Call CloseLogger() when the main application shuts down to flush remaining logs.
 func CloseLogger() {
-  //Stop the background telemetry ticker cleanly.
-  close(monitorStopChan)
-  //Shut down the log stream channel and wait for the worker to finish flushing.
-  close(logChannel)
-  workerWg.Wait()  //Wait for the background worker to safely print out everything left in the queue.
-  //Perform a final, definitive count check of total drops upon application exit.
-  if finalDrops := atomic.LoadUint64(&droppedLogs); finalDrops > 0 {
-    /***
-    Ignore the number of bytes written and error. Unlike os.Stderr.Write(), it does not require to convert the string
-    into a []byte slice first, saving a memory allocation.
-    ***/
-    _, _ = os.Stderr.WriteString("LOGGER SHUTDOWN: Application terminated with a total of " +
-      strconv.FormatUint(finalDrops, 10/*base*/) + " dropped logs due to channel saturation.\n")
-  }
+  /***
+  If a developer inadvertently triggers CloseLogger() twice during an intricate microservice teardown script, the duplicate
+  call 'close(monitorStopChan)' will cause a panic (closing an already closed channel). If your service framework contains
+  nested teardown functions, you can make CloseLogger completely idempotent by wrapping it in a protective sync.Once.
+  ***/
+  closeLoggerOnce.Do(func() {
+    if logChannel == nil { return }
+    //Stop the background telemetry ticker cleanly.
+    close(monitorStopChan)
+    //Shut down the log stream channel and wait for the worker to finish flushing.
+    close(logChannel)
+    workerWg.Wait()  //Wait for the background worker to safely print out everything left in the queue.
+    //Perform a final, definitive count check of total drops upon application exit.
+    if finalDrops := atomic.LoadUint64(&droppedLogs); finalDrops > 0 {
+      /***
+      Ignore the number of bytes written and error. Unlike os.Stderr.Write(), it does not require to convert the string
+      into a []byte slice first, saving a memory allocation.
+      ***/
+      _, _ = os.Stderr.WriteString("LOGGER SHUTDOWN: Application terminated with a total of " +
+        strconv.FormatUint(finalDrops, 10/*base*/) + " dropped logs due to channel saturation.\n")
+    }
+  })
 }
 
-//startDroppedLogsMonitor tracks logging pipeline health every 10 seconds.
+/***
+startDroppedLogsMonitor tracks logging pipeline health every 10 seconds.
+This function runs permanently in the background as a dedicated goroutine.
+***/
 func startDroppedLogsMonitor() {
-  go func() {
-    /***
-    This code sets up a time-based recurring interval that fires an event every 10 seconds and ensures its underlying OS
-    resources are cleaned up when the surrounding function finishes.
-    ***/
-    ticker := time.NewTicker(10 * time.Second)
-    defer ticker.Stop()  //Guarantees cleanup when function exits.
-    var lastLoggedDrops uint64 = 0
-    for {
-      //If none of the channels are ready to send or receive data, the goroutine completely pauses at the select statement.
-      select {
-      case <-ticker.C:
-        currentDrops := atomic.LoadUint64(&droppedLogs)
-        if currentDrops > lastLoggedDrops {
-          newDrops := currentDrops - lastLoggedDrops
-          lastLoggedDrops = currentDrops
-          //Forcing an unbuffered stderr write bypasses the stuck worker channel.
-          _, _ = os.Stderr.WriteString("ALERT: Logging queue capacity saturated! Dropped " + strconv.FormatUint(newDrops, 10) +
-            " message(s) in the last 10s. Total dropped so far: " + strconv.FormatUint(currentDrops, 10) + "\n")
-        }
-      case <-monitorStopChan:
-        return  //Gracefully exit the loop when CloseLogger is called.
+  /***
+  This code sets up a time-based recurring interval that fires an event every 10 seconds and ensures its underlying OS
+  resources are cleaned up when the surrounding function finishes.
+  ***/
+  ticker := time.NewTicker(10 * time.Second)
+  defer ticker.Stop()  //Guarantees cleanup when function exits.
+  var lastLoggedDrops uint64 = 0
+  for {
+    //If none of the channels are ready to send or receive data, the goroutine completely pauses at the select statement.
+    select {
+    case <-ticker.C:
+      currentDrops := atomic.LoadUint64(&droppedLogs)
+      if currentDrops > lastLoggedDrops {
+        newDrops := currentDrops - lastLoggedDrops
+        lastLoggedDrops = currentDrops
+        //Forcing an unbuffered stderr write bypasses the stuck worker channel.
+        _, _ = os.Stderr.WriteString("ALERT: Logging queue capacity saturated! Dropped " + strconv.FormatUint(newDrops, 10) +
+          " message(s) in the last 10s. Total dropped so far: " + strconv.FormatUint(currentDrops, 10) + "\n")
       }
+    case <-monitorStopChan:
+      return  //Gracefully exit the loop when CloseLogger is called.
     }
-  }()
+  }
 }
 
 // =========================================================================
@@ -182,7 +197,16 @@ func DatetimeFormat() string {
 }
 
 func queueMessage[T Loggable](msg T, cid, level string) {
+  /***
+  If logChannel is nil, it will safely invoke InitLogger() to build the pipeline before executing the rest of the log
+  formatting logic.
+  ***/
+  if logChannel == nil {
+    InitLogger()
+  }
   var payload asyncLogPayload
+  payload.msgBytes = nil
+  payload.msgStr = ""
   payload.cid = cid
   payload.level = level
   payload.isPooled = false
@@ -191,8 +215,9 @@ func queueMessage[T Loggable](msg T, cid, level string) {
     payload.msgStr = v
   case []byte:
     //Only use the pool if the log fits within the standard 4KB block size.
-    if len(v) <= 4096 {
+    if len(v) <= poolSize {
       poolPtr := snapshotPool.Get().(*[]byte)
+      payload.poolSlice = poolPtr  //Save the exact pointer container.
       snapshot := (*poolPtr)[:len(v)]  //Slice it to exact match length.
       copy(snapshot, v)
       payload.msgBytes = snapshot
@@ -227,27 +252,47 @@ func queueMessage[T Loggable](msg T, cid, level string) {
       sync.Pool stores the actual slice descriptor, you must reset the length of the slice back to its maximum capacity
       (:cap(...)) right before calling .Put(). This guarantees that whoever rents that block next receives the full 4KB
       array capacity intact.
+
+      Re-slice the underlying array back to full capacity inside the original container.
       ***/
-      fullSlice := payload.msgBytes[:cap(payload.msgBytes)]
-      snapshotPool.Put(&fullSlice)
+      *payload.poolSlice = (*payload.poolSlice)[:cap(*payload.poolSlice)]
+      snapshotPool.Put(payload.poolSlice)  //Pass the original valid heap pointer.
     }
   }
 }
 
-
-
-// ==========================================
+// =========================================================================
 // BACKGROUND WORKER
 // Zero-Allocation (Reuses pool buffers directly)
-// ==========================================
+// =========================================================================
 func logWorker() {
-  defer workerWg.Done()
+  defer workerWg.Done()  //Decrease the WaitGroup counter by exactly 1.
+  /***
+  The loop blocks and processes logs as they arrive.
+  When logChannel is closed, it cleanly drains all remaining logs.
+  ***/
   for item := range logChannel {
-    //Borrow an object from the pool (returns an 'any' type, so assert it).
+    /***
+    bufferPool.Get(): This asks the sync.Pool for an object. If the pool has a previously used bytes.Buffer sitting inside it,
+    it hands it back to you. If the pool is empty, it runs your 'New:' function to allocate a fresh one.
+    .(*bytes.Buffer): Because Get() returns Go's empty interface type (any), you must use this syntax -- called a type assertion --
+    to tell the compiler, "I know this object is a pointer to a bytes.Buffer, treat it as one."
+    ***/
     buf := bufferPool.Get().(*bytes.Buffer)
-    //Always reset the object's internal state before or after reuse.
+    /***
+    This empties the buffer's internal slice, making it completely blank and ready for a new log message. But while .Reset() sets
+    the string length back to zero, it does not throw away the underlying byte slice allocation. The capacity remains intact.
+
+    Without a sync.Pool and .Reset(), writing 1,000,000 log messages requires you to create 1,000,000 separate buffer objects. This
+    floods your computer's memory and forces Go's Garbage Collector (GC) to constantly run to clean them up, which slows down your
+    application.
+
+    By combining Get() and Reset(), your application might only ever allocate a handful of buffers. Goroutines constantly cycle
+    through them -- borrowing, clearing, using, and returning them -- resulting in near-zero memory allocations and a much faster
+    application.
+    ***/
     buf.Reset()
-    //Manually building JSON layout avoids encoding/json reflection overhead
+    //Manually building JSON layout avoids encoding/json reflection overhead.
     buf.WriteString(`{"date_time":"`)
     buf.WriteString(time.Now().UTC().Format(time.RFC3339Nano))
     buf.WriteString(`","level":"`)
@@ -257,142 +302,76 @@ func logWorker() {
     buf.WriteString(`","msg":`)
     //Process the message content based on what was provided.
     if item.msgBytes != nil {
-      trimmed := bytes.TrimSpace(item.msgBytes)
-      //Check if it's already a structural JSON block (like an object or array)
-//checking for a length of at least 2 bytes (> 1) is the correct mathematical representation of a JSON block. A valid JSON object or array requires both an opening and a closing delimiter (like {} or []), meaning it must be at least 2 bytes long.
-      if len(trimmed) > 1 && ((trimmed[0] == '{' && trimmed[len(trimmed) - 1] == '}') ||
-                              (trimmed[0] == '[' && trimmed[len(trimmed) - 1] == ']')) {
-        buf.Write(trimmed)
+      itemTrimmed := bytes.TrimSpace(item.msgBytes)
+      itemTrimmedLen := len(itemTrimmed)
+      /***
+      Check if it's already a structural JSON block (like an object or array).
+      Checking for a length of at least 2 bytes (> 1) is the correct mathematical representation of a JSON block. A valid JSON
+      object or array requires both an opening and a closing delimiter (like {} or []), meaning it must be at least 2 bytes long.
+      ***/
+      if itemTrimmedLen > 1 && ((itemTrimmed[0] == '{' && itemTrimmed[itemTrimmedLen - 1] == '}') ||
+                                (itemTrimmed[0] == '[' && itemTrimmed[itemTrimmedLen - 1] == ']')) {
+        buf.Write(itemTrimmed)
       } else {
-        //Otherwise, safely escape it as a string
-        b, _ := json.Marshal(string(item.msgBytes))
-        buf.Write(b)
+        /***
+        By writing string(item.msgBytes) directly inside the argument list of the append context, you trigger the compiler's
+        specialized fast-path, achieving the speed of a raw pointer copy with zero garbage collection overhead.
+
+        Let AppendQuote write directly into the buffer's backing memory array.
+        ***/
+        var tmp []byte
+        //Update the buffer's tracker to cleanly match the newly extended slice.
+        buf.Write(strconv.AppendQuote(tmp, string(itemTrimmed)))
       }
     } else {
       msgStr := item.msgStr
-      length := len(msgStr)
+      msgStrLen := len(msgStr)
       isJSON := false
-
-      // Fast-path: Check if the string naturally starts and ends with brackets (no spaces)
-      if length > 1 && ((msgStr[0] == '{' && msgStr[length - 1] == '}') ||
-                        (msgStr[0] == '[' && msgStr[length - 1] == ']')) {
+      //Fast-path: Check if the string naturally starts and ends with brackets (no spaces).
+      if msgStrLen > 1 && ((msgStr[0] == '{' && msgStr[msgStrLen - 1] == '}') ||
+                           (msgStr[0] == '[' && msgStr[msgStrLen - 1] == ']')) {
         isJSON = true
       } else {
-        // Slow-path: Only run standard trimming if it didn't pass the fast-path.
-        // strings.TrimSpace cleanly handles both ASCII and Unicode if an emoji ever slips in.
-        trimmedStr := strings.TrimSpace(msgStr)
-        tLen := len(trimmedStr)
-        if tLen >= 2 && ((trimmedStr[0] == '{' && trimmedStr[tLen-1] == '}') ||
-                        (trimmedStr[0] == '[' && trimmedStr[tLen-1] == ']')) {
-          msgStr = trimmedStr
+        /***
+        Slow-path: Only run standard trimming if it didn't pass the fast-path.
+        strings.TrimSpace cleanly handles both ASCII and Unicode if an emoji ever slips in.
+        strings.TrimSpace just manipulates the indexes -- it does not allocate a new string structure or duplicate the text in memory.
+        ***/
+        itemTrimmed := strings.TrimSpace(msgStr)
+        itemTrimmedLen := len(itemTrimmed)
+        if itemTrimmedLen > 1 && ((itemTrimmed[0] == '{' && itemTrimmed[itemTrimmedLen - 1] == '}') ||
+                                  (itemTrimmed[0] == '[' && itemTrimmed[itemTrimmedLen - 1] == ']')) {
+          msgStr = itemTrimmed
           isJSON = true
         }
       }
-
+      //
       if isJSON {
         buf.WriteString(msgStr)
-      } else {
-        // Safely escape normal text strings or logs with messages
-        b, _ := json.Marshal(item.msgStr)
-        buf.Write(b)
+      } else {  //Safely escape normal text strings or logs with messages.
+        /***
+        Direct, zero-allocation appending of the string message
+        Under the hood, strconv.AppendQuote always takes your input, wraps it in quotes ("), escapes any special characters, and
+        appends those characters onto a backing byte slice.
+        ***/
+        // Create a fast, zero-allocation slice pointer using a slice literal allocation-free idiom
+        var tmp []byte
+        buf.Write(strconv.AppendQuote(tmp, item.msgStr))
       }
-      //It was a string or error type payload. Check if it happens to contain a raw JSON string
-      // while handling string escaping efficiently.
-      // ACTUALLY trim the space so the JSON structural check is accurate
-      // trimmed := strings.TrimSpace(item.msgStr)
-
-      // if len(trimmed) > 1 && ((trimmed[0] == '{' && trimmed[len(trimmed) - 1] == '}') ||
-      //                            (trimmed[0] == '[' && trimmed[len(trimmed) - 1] == ']')) {
-      //   buf.WriteString(trimmed)
-      // } else {
-      //   b, _ := json.Marshal(item.msgStr)
-      //   buf.Write(b)
-      // }
     }
     //Adding a newline character (\n) right after the closing brace acts as a delimiter.
     //If you omit the newline, multiple distinct log logs will clump together into a single, massive string line (e.g., {"date_time":...}{"date_time":...}).
     //Almost all enterprise log management utilities rely strictly on the JSON Lines (JSONL) format, which mandates that every single independent JSON object must sit cleanly on its own individual text line.
     buf.WriteString("}\n")
-    //Perform a single write call per log line
+    //Perform a single write call per log line.
     _, _ = os.Stdout.Write(buf.Bytes())
     //Return the object back to the pool when done.
     bufferPool.Put(buf)
     //Return the snapshot memory to the pool.
     if item.isPooled {
-      //Re-slice to its full underlying array capacity before returning.
-      fullSlice := item.msgBytes[:cap(item.msgBytes)]
-      snapshotPool.Put(&fullSlice)
+      //Re-slice the underlying array back to full capacity inside the original container.
+      *item.poolSlice = (*item.poolSlice)[:cap(*item.poolSlice)]
+      snapshotPool.Put(item.poolSlice)  //Pass the original valid heap pointer.
     }
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-//queueMessage isolates memory snapshots and shifts routing to the async loop or fallback valves.
-// func queueMessage(msg []byte, cid, level string) {
-//   /***
-//   Allocate a fresh slice exactly matching the size of this specific message payload.
-//   This isolates the memory so the HTTP request thread can never overwrite it.
-//   ***/
-//   snapshot := make([]byte, len(msg))
-//   copy(snapshot, msg)
-//   payload := asyncLogPayload{
-//     msg:   snapshot,
-//     cid:   cid,
-//     level: level,
-//   }
-//   //Use a 'select' statement with a 'default' branch to avoid blocking.
-//   select {
-//   case logChannel <- payload:
-//     //Queue has room, message safely dropped into the channel loop!
-//   default:
-//     /***
-//     An emergency fallback mechanism is a safety valve for your logging pipeline. It defines what your application should do when
-//     your asynchronous queue fills up completely (reaches its 50,000 capacity limit) during a sudden traffic spike or a downstream
-//     disk slow-down.
-
-//     In a standard channel implementation, when a channel reaches capacity, it blocks the calling thread. If your logger blocks,
-//     all of your incoming user HTTP requests will freeze, cascading into a major application outage.
-
-//     Under a heavy load, you must choose how your application responds if the queue fills up. The strategy implemented here is the
-//     "Drop Lower-Priority Logs"; i.e., if the queue fills up, you drop minor logs (like INFO or WARN) to make room for critical logs
-//     and keep user HTTP requests moving at full speed.
-//     ***/
-//     //EMERGENCY FALLBACK: Queue is full!
-//     if level == "ERROR" {
-//       //Sink critical errors into valid, structural JSON directly to Stderr.
-//       var rawMsg json.RawMessage
-//       trimmed := bytes.TrimSpace(snapshot)
-//       if len(trimmed) > 0 && ((trimmed[0] == '{' && trimmed[len(trimmed) - 1] == '}') ||
-//                               (trimmed[0] == '[' && trimmed[len(trimmed) - 1] == ']')) {
-//         rawMsg = trimmed
-//       } else {
-//         safeBytes, _ := json.Marshal(string(snapshot))
-//         rawMsg = safeBytes
-//       }
-//       //Ensure it still outputs as a valid JSON structural block for the central log collector.
-//       le := logEntry{
-//         DateTime:      time.Now().UTC().Format(time.RFC3339Nano),
-//         CorrelationId: cid,
-//         Level:         "ERROR_OVERFLOW",  //Clearly identifies dropped traffic failovers.
-//         Message:       rawMsg,
-//       }
-//       //Marshal it safely.
-//       if jsonData, err := json.Marshal(le); err == nil {
-//         jsonData = append(jsonData, '\n')
-//         //If it's a critical error, force-write it synchronously to stderr so it's not lost.
-//         _, _ = os.Stderr.Write(jsonData)
-//       }
-//     }
-//     //For other message logs (e.g., INFO or WARN), they get dropped silently here to protect application uptime.
-//   }
-// }
