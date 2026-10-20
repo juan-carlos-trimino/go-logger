@@ -20,8 +20,8 @@ import (
 )
 
 /***
-Implementation of a high-throughput logging library: It integrates Go 1.18+ Generics, sync.Pool memory recycling, an Asynchronous
-Channel Pipeline, and the Non-Blocking Emergency Fallback Engine.
+Implementation of a high-throughput logging library: It integrates sync.Pool memory recycling, an Asynchronous Channel Pipeline,
+and the Non-Blocking Emergency Fallback Engine.
 
 To handle heavy customer traffic without slowing down your HTTP web requests, you must remove synchronous terminal/disk I/O from
 the request lifecycle. Writing directly to os.Stdout inside a request thread acts like a brake pedal. If your terminal is slow or
@@ -63,11 +63,11 @@ var (
   //A dedicated pool for raw byte slice snapshots; it allocates fixed 4KB blocks to prevent frequent heap resizing.
   snapshotPool = sync.Pool{
     New: func() any {
-      b := make([]byte, poolSize)
+      b := make([]byte, poolSize)  //The capacity defaults to the specified length.
       return &b  //Pass a pointer to avoid interface boxing overhead.
     },
   }
-  droppedLogs uint64 = 0  //Atomic counter for dropped logs.
+  droppedLogs atomic.Uint64  //Atomic counter for dropped logs.
   /***
   Signal the monitoring routine to stop on shutdown. In Go, an empty struct (struct{}) occupies exactly 0 bytes of memory.
   Developers use it to create pure signaling channels.
@@ -83,7 +83,7 @@ type logPayload struct{
   poolSlice *[]byte  //Hold the exact pointer returned by Get().
   cid      string
   level    string
-  isPooled bool
+  isPooled bool  //Zero value is 'false'.
 }
 
 // =========================================================================
@@ -95,7 +95,8 @@ ensure it is called before any log statements.
 ***/
 func InitLogger() {
   initLoggerOnce.Do(func() {
-    //A channel that can hold logQueueCapacity logPayload before blocking the sender.
+    droppedLogs.Store(0)
+    //A channel that can hold logQueueCapacity of logPayload before blocking the sender.
     logChannel = make(chan logPayload, logQueueCapacity)
     /***
     Initialize an unbuffered channel.
@@ -117,13 +118,14 @@ func CloseLogger() {
   //Stop the background telemetry ticker cleanly.
   close(monitorStopChan)
   //Shut down the log stream channel and wait for the worker to finish flushing.
-  close(logChannel)  //TO AVOID A DEADLOCK DO NOT PLACE THIS LINE AFTER THE WAIT(); SEE THE logWorker.
+  close(logChannel)  //TO AVOID A DEADLOCK, DO NOT PLACE THIS LINE AFTER THE WAIT(); SEE THE logWorker.
   workerWg.Wait()  //Wait for the background worker to safely print out everything left in the queue.
   //Perform a final, definitive count check of total drops upon application exit.
-  if finalDrops := atomic.LoadUint64(&droppedLogs); finalDrops > 0 {
+  if finalDrops := droppedLogs.Load(); finalDrops > 0 {
     /***
-    Ignore the number of bytes written and any error. Unlike os.Stderr.Write(), it does not require to convert the string
-    into a []byte slice first, saving a memory allocation.
+    Ignore the number of bytes written and any error.
+    Unlike os.Stderr.Write(), it does not require to convert the string into a []byte slice first, saving a
+    memory allocation.
     ***/
     _, _ = os.Stderr.WriteString("LOGGER SHUTDOWN: Application terminated with a total of " +
       strconv.FormatUint(finalDrops, 10/*base*/) + " dropped log(s) due to channel saturation.\n")
@@ -146,13 +148,12 @@ func startDroppedLogsMonitor() {
     //If none of the channels are ready to send or receive data, the goroutine completely pauses at the select statement.
     select {
     case <-ticker.C:
-      currentDrops := atomic.LoadUint64(&droppedLogs)
-      if currentDrops > lastLoggedDrops {
+      if currentDrops := droppedLogs.Load(); currentDrops > lastLoggedDrops {
         newDrops := currentDrops - lastLoggedDrops
         lastLoggedDrops = currentDrops
         //Forcing an unbuffered stderr write bypasses the stuck worker channel.
         _, _ = os.Stderr.WriteString("ALERT: Logging queue capacity saturated! Dropped " + strconv.FormatUint(newDrops, 10) +
-          " message(s) in the last 10s. Total dropped so far: " + strconv.FormatUint(currentDrops, 10) + "\n")
+          " log(s) in the last 10s. Total dropped so far: " + strconv.FormatUint(currentDrops, 10) + "\n")
       }
     case <-monitorStopChan:
       return  //Gracefully exit the loop when CloseLogger is called.
@@ -195,23 +196,20 @@ func queueStringMessage(msg, cid, level string) {
     panic("CRITICAL: Logger used before initialization! Ensure InitLogger() AND defer CloseLogger run at application startup.")
   }
   var payload logPayload
-  // payload.msgBytes = nil
   payload.msgStr = msg
-  // payload.poolSlice = nil
   payload.cid = cid
   payload.level = level
-  // payload.isPooled = false
   /***
   Implement the non-blocking emergency fallback mechanism.
   * Queue has room: When the logging volume is normal, the 'case logChannel <- payload:' statement succeeds immediately.
-  * Queue is full: If the logging channel fills up entirely, a standard channel send statement like 'logChannel <- payload' would block
-    the thread and freeze the application. This means user HTTP requests would stall, cascading into a major outage. By adding the
-    'default:' branch, the Go runtime instantly skip the channel and run the code inside the default block instead.
+  * Queue is full: If the logging channel fills up entirely, a standard channel send statement like 'logChannel <- payload'
+    would block the thread and freeze the application. This means user HTTP requests would stall, cascading into a major outage.
+    By adding the 'default:' branch, the Go runtime instantly skip the channel and run the code inside the default block instead.
   ***/
   select {
   case logChannel <- payload:
   default:
-    atomic.AddUint64(&droppedLogs, 1)
+    droppedLogs.Add(1)
   }
 }
 
@@ -220,46 +218,41 @@ func queueBytesMessage(msg []byte, cid, level string) {
     panic("CRITICAL: Logger used before initialization! Ensure InitLogger() AND defer CloseLogger run at application startup.")
   }
   var payload logPayload
-  // payload.msgBytes = nil
-  // payload.msgStr = ""
-  // payload.poolSlice = nil
   payload.cid = cid
   payload.level = level
-  // payload.isPooled = false
-  //Only use the pool if the log fits within the standard 4KB block size.
+  /***
+  Isolate the memory immediately on the calling thread.
+  The payload carries a unique pointer (snapshot) that no other goroutine in the application has access to,
+  except for the background logWorker.
+  ***/
   if len(msg) <= poolSize {
+    //Only use the pool if the log fits within the standard 4KB block size.
     poolPtr := snapshotPool.Get().(*[]byte)
     payload.poolSlice = poolPtr  //Save the exact pointer container.
     snapshot := (*poolPtr)[:len(msg)]  //Slice it to exact match length.
     copy(snapshot, msg)
     payload.msgBytes = snapshot
     payload.isPooled = true  //Flag so the worker knows to return it!
-  } else {  //Fallback to a standard allocation for exceptionally large payloads.
-    //Only allocate and snapshot here because []byte is mutable and could change before the async worker processes the channel.
-    snapshot := make([]byte, len(msg))
+  } else {
     /***
-    Isolate the memory immediately on the calling thread. The payload carries a unique pointer (snapshot) that no other goroutine
-    in the application has access to, except for the background logWorker. This step does cost one memory allocation per byte slice
-    log, but it is 100% required to ensure memory isolation and data thread safety when dealing with mutable slices across channels.
+    Fallback to a standard allocation for exceptionally large payloads. This step does cost one memory allocation per byte
+    slice log, but it is 100% required to ensure memory isolation and data thread safety when dealing with mutable slices
+    across channels. That is, only allocate and snapshot here because []byte is mutable and could change before the async
+    worker processes the channel.
     ***/
+    snapshot := make([]byte, len(msg))
     copy(snapshot, msg)
     payload.msgBytes = snapshot
   }
-  /***
-  Implement the non-blocking emergency fallback mechanism.
-  * Queue has room: When the logging volume is normal, the 'case logChannel <- payload:' statement succeeds immediately.
-  * Queue is full: If the logging channel fills up entirely, a standard channel send statement like 'logChannel <- payload' would block
-    the thread and freeze the application. This means user HTTP requests would stall, cascading into a major outage. By adding the
-    'default:' branch, the Go runtime instantly skip the channel and run the code inside the default block instead.
-  ***/
+  //
   select {
   case logChannel <- payload:
   default:
-    atomic.AddUint64(&droppedLogs, 1)
+    droppedLogs.Add(1)
     //If the queue is full and we drop the log, return the memory to the pool immediately!
     if payload.isPooled {
       /***
-      When you execute (*poolPtr)[:len(v)] to fit a message exactly, you alter the slice header's length. Since Go's
+      When you execute (*poolPtr)[:len(msg)] to fit a message exactly, you alter the slice header's length. Since Go's
       sync.Pool stores the actual slice descriptor, you must reset the length of the slice back to its maximum capacity
       (:cap(...)) right before calling .Put(). This guarantees that whoever rents that block next receives the full 4KB
       array capacity intact.
@@ -332,17 +325,19 @@ func logWorker() {
         ***/
         buf.Write(payloadTrimmed)
       } else {
+        //Get a slice header representing the empty capacity right after your current data.
+        currentLen := buf.Len()
+        freeSpace := buf.Bytes()[currentLen:currentLen]  //Zero-length slice sitting at the end of written data.
         /***
         By writing string(payloadTrimmed) directly inside the argument list of the append context, you trigger the compiler's
         specialized fast-path, achieving the speed of a raw pointer copy with zero garbage collection overhead.
         ***/
-        //Get a slice header representing the empty capacity right after your current data.
-        currentLen := buf.Len()
-        freeSpace := buf.Bytes()[currentLen:currentLen]  //Zero-length slice sitting at the end of written data.
         //AppendQuote appends to that empty slice using the buffer's backing memory pool.
         quotedBytes := strconv.AppendQuote(freeSpace, string(payloadTrimmed))
-        //Write those newly generated bytes directly to the buffer.
-        //(This safely updates the buffer's length and trackers automatically without Truncate)
+        /***
+        Write those newly generated bytes directly to the buffer.
+        This safely updates the buffer's length and trackers automatically without Truncate.
+        ***/
         buf.Write(quotedBytes)
       }
     } else {
@@ -357,7 +352,8 @@ func logWorker() {
         /***
         Slow-path: Only run standard trimming if it didn't pass the fast-path.
         strings.TrimSpace cleanly handles both ASCII and Unicode if an emoji ever slips in.
-        strings.TrimSpace just manipulates the indexes -- it does not allocate a new string structure or duplicate the text in memory.
+        strings.TrimSpace just manipulates the indexes -- it does not allocate a new string structure or duplicate
+        the text in memory.
         ***/
         msgStrTrimmed := strings.TrimSpace(msgStr)
         msgStrTrimmedLen := len(msgStrTrimmed)
@@ -371,27 +367,25 @@ func logWorker() {
       if isJSON {
         buf.WriteString(msgStr)
       } else {  //Safely escape normal text strings or logs with messages.
-        /***
-        Direct, zero-allocation appending of the string message
-        Under the hood, strconv.AppendQuote always takes your input, wraps it in quotes ("), escapes any special characters, and
-        appends those characters onto a backing byte slice.
-        ***/
         //Get a slice header representing the empty capacity right after your current data.
         currentLen := buf.Len()
         freeSpace := buf.Bytes()[currentLen:currentLen]  //Zero-length slice sitting at the end of written data.
+        /***
+        Direct, zero-allocation appending of the string message.
+        Under the hood, strconv.AppendQuote always takes your input, wraps it in quotes ("), escapes any special
+        characters, and appends those characters onto a backing byte slice.
+        ***/
         //AppendQuote appends to that empty slice using the buffer's backing memory pool.
         quotedBytes := strconv.AppendQuote(freeSpace, payload.msgStr)
-        //Write those newly generated bytes directly to the buffer.
-        //(This safely updates the buffer's length and trackers automatically without Truncate).
         buf.Write(quotedBytes)
       }
     }
     /***
-    Adding a newline character (\n) right after the closing brace acts as a delimiter. If you omit the newline, multiple distinct logs
-    will clump together into a single, massive string line (e.g., {"date_time":...}{"date_time":...}).
+    Adding a newline character (\n) right after the closing brace acts as a delimiter. If you omit the newline, multiple
+    distinct logs will clump together into a single, massive string line (e.g., {"date_time":...}{"date_time":...}).
 
-    Almost all enterprise log management utilities rely strictly on the JSON Lines (JSONL) format, which mandates that every single
-    independent JSON object must sit cleanly on its own individual text line.
+    Almost all enterprise log management utilities rely strictly on the JSON Lines (JSONL) format, which mandates that
+    every single independent JSON object must sit cleanly on its own individual text line.
     ***/
     buf.WriteString("}\n")
     //Perform a single write call per log line.
