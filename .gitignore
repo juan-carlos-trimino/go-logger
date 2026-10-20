@@ -8,3 +8,9 @@
 !logger_test.go
 !logger.go
 !README.md
+# ... and these files under the '.github' directory...
+!.github/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/go.yml
