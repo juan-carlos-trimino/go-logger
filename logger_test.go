@@ -1,28 +1,6 @@
 package logger
 
 /***
-Here are the three specific commands you can use depending on what you want to isolate:
-
-By default, Go runs each benchmark for exactly 1 second. To customize the benchmark sampling time, you use the -benchtime flag.
-Alternatively, if you would prefer to benchmark an exact number of execution loops instead of a time window, you can append an x
-to the flag value. For example, to force each benchmark block to process exactly 10 million operations, you can execute:
-go test ../../../gp-meta-repo/go-logger -v -bench=. -benchmem -benchtime=10000000x
-
-1. Run ONLY the Safety Overflow Test (Skips Benchmarks)
-If you are modifying code and want a fast check to ensure your safety fallback logic isn't broken, run this. It executes in
-milliseconds because it skips the millions of benchmark loops:
-go test ../../../gp-meta-repo/go-logger -v -run=TestLogger_PayloadExceedsPoolSize -benchtime=1s
-
-2. Run ONLY the Zero-Allocation Benchmarks (Skips Safety Test)
-If you want to isolate your performance metrics (34.27 ns/op, 0 B/op) without letting the functional test disrupt your timing,
-use this flag combination (the -run=^$ regex tells Go to match zero standard tests):
-go test ../../../gp-meta-repo/go-logger -bench=. -benchmem -run=^$ -benchtime=5s
-
-3. Run EVERYTHING (The Combined Super-Command)
-It scans the package, fires off your functional safety validation, captures the output, resets the counters, and immediately rolls
-straight into your parallel multi-core performance tests:
-go test ../../../gp-meta-repo/go-logger -v -bench=. -benchmem -benchtime=5s
-
 Execute this command in your terminal to kick off the allocation tracking profiles:
 go test ../../../gp-meta-repo/go-logger -bench=. -benchmem -cpu=4
 
