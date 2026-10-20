@@ -24,7 +24,7 @@ straight into your parallel multi-core performance tests:
 go test ../../../gp-meta-repo/go-logger -v -bench=. -benchmem -benchtime=5s
 
 Execute this command in your terminal to kick off the allocation tracking profiles:
-go test ../../../gp-meta-repo/go-logger -bench=. -benchmem -cpu=7
+go test ../../../gp-meta-repo/go-logger -bench=. -benchmem -cpu=4
 
 When the command completes, your terminal output will look like this:
 goos: linux
