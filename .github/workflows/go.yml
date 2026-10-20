@@ -1,0 +1,40 @@
+name: Go Logger CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  validate-and-benchmark:
+    name: Build, Test, and Profile
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. Check out the repository source code
+    - name: Check out Source Code
+      uses: actions/checkout@v4
+
+    # 2. Set up a secure, modern Go environment execution runtime
+    - name: Set up Go Runtime
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24' # Pin minimum Go version supporting the required library components
+        cache: true        # Automatically caches Go modules and build structures for speed
+
+    # 3. Ensure local module dependencies are perfectly synchronized and clean
+    - name: Synchronize Module Dependencies
+      run: go mod tidy && go mod verify
+
+    # 4. Verify the package compiles flawlessly
+    - name: Build Code Compilation Target
+      run: go build -v ./...
+
+    # 5. Execute your functional fallback integration tests
+    - name: Run Functional Safety Tests
+      run: go test -v -run=TestLogger_PayloadExceedsPoolSize ./...
+
+    # 6. Execute performance benchmarks to actively monitor for accidental memory regression
+    - name: Execute Allocation Performance Benchmarks
+      run: go test -bench=. -benchmem -run=^$ -benchtime=1s ./...
